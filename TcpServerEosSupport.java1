@@ -10,38 +10,34 @@ import java.util.concurrent.*;
 public class TcpServerEosSupport {
 
     private final Properties config = new Properties();
-    private final Map<SocketChannel, byte[]> sessionBuffers = new ConcurrentHashMap<>();
+    private final Map<SocketChannel, StringBuilder> sessionStates = new ConcurrentHashMap<>();
     private final Map<SocketChannel, Long> lastActive = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
 
     private ExecutorService workerPool;
     private Selector selector;
     private ServerSocketChannel serverChannel;
-    private final byte[] delimiter;
+    private final String delimiter;
 
     public TcpServerEosSupport() {
         loadConfig();
         validateMandatory();
         initializeThreadPool();
         setupShutdownHook();
-        String rawDelim = getOpt("DELIMITER", "0x0A");
-        this.delimiter = parseDelimiterBytes(rawDelim);
+        this.delimiter = parseDelimiter(getOpt("DELIMITER", "0x0A"));
     }
 
-    private byte[] parseDelimiterBytes(String input) {
+    private String parseDelimiter(String input) {
         try {
             if (input.startsWith("0x")) {
-                String hex = input.substring(2);
-                byte[] bytes = new byte[hex.length() / 2];
-                for (int i = 0; i < bytes.length; i++) {
-                    bytes[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-                }
-                return bytes;
+                int hex = Integer.parseInt(input.substring(2), 16);
+                return String.valueOf((char) hex);
             }
+            System.err.println("[WARN ] Delimiter must be hex (0x..). Defaulting to 0x0A.");
         } catch (Exception e) {
-            System.err.println("[WARN ] Invalid hex format: " + input);
+            System.err.println("[WARN ] Invalid hex format: " + input + ". Defaulting to 0x0A.");
         }
-        return new byte[]{0x0A};
+        return "\n";
     }
 
     private void loadConfig() {
@@ -99,7 +95,7 @@ public class TcpServerEosSupport {
                 if (serverChannel != null) {
                     serverChannel.close();
                 }
-                for (SocketChannel client : sessionBuffers.keySet()) {
+                for (SocketChannel client : sessionStates.keySet()) {
                     client.close();
                 }
             } catch (IOException e) {
@@ -127,7 +123,9 @@ public class TcpServerEosSupport {
         System.out.println("[INFO ] Server started on " + host + ":" + port);
 
         while (!Thread.currentThread().isInterrupted()) {
-            selector.select();
+            if (selector.select() == 0) {
+                continue;
+            }
             Iterator<SelectionKey> iter = selector.selectedKeys().iterator();
             while (iter.hasNext()) {
                 SelectionKey key = iter.next();
@@ -148,75 +146,51 @@ public class TcpServerEosSupport {
     private void handleAccept(ServerSocketChannel serverChannel, Selector selector) throws IOException {
         SocketChannel client = serverChannel.accept();
         client.configureBlocking(false);
-        client.socket().setTcpNoDelay(true);
         client.register(selector, SelectionKey.OP_READ);
-        sessionBuffers.put(client, new byte[0]);
+        sessionStates.put(client, new StringBuilder());
         lastActive.put(client, System.currentTimeMillis());
     }
 
     private void handleRead(SelectionKey key) {
-        final byte[] activeDelim = this.delimiter;
+        final String activeDelim = this.delimiter;
         workerPool.submit(() -> {
             SocketChannel client = (SocketChannel) key.channel();
-            ByteBuffer buffer = ByteBuffer.allocate(8192);
-            int limit = Integer.parseInt(getOpt("MAX_MESSAGE_SIZE", "10"));
+            ByteBuffer buffer = ByteBuffer.allocate(2048);
+            int limit = Integer.parseInt(getOpt("MAX_MESSAGE_SIZE", "10000"));
 
             try {
                 int bytesRead = client.read(buffer);
-                byte[] existing = sessionBuffers.getOrDefault(client, new byte[0]);
-                byte[] combined;
-
-                if (bytesRead > 0) {
-                    buffer.flip();
-                    byte[] incoming = new byte[buffer.remaining()];
-                    buffer.get(incoming);
-                    lastActive.put(client, System.currentTimeMillis());
-                    
-                    combined = new byte[existing.length + incoming.length];
-                    System.arraycopy(existing, 0, combined, 0, existing.length);
-                    System.arraycopy(incoming, 0, combined, existing.length, incoming.length);
-                } else {
-                    combined = existing;
-                }
-
-                if (combined.length > limit) {
-                    System.out.println("[WARN ] Max message size exceeded. Closing connection.");
+                if (bytesRead == -1) {
+                    StringBuilder sb = sessionStates.get(client);
+                    if (sb != null && sb.length() > 0) {
+                        processBusinessLogic(client, sb.toString());
+                    }
                     closeConnection(client);
                     return;
                 }
 
-                int start = 0;
-                for (int i = 0; i <= combined.length - activeDelim.length; i++) {
-                    boolean match = true;
-                    for (int j = 0; j < activeDelim.length; j++) {
-                        if (combined[i + j] != activeDelim[j]) {
-                            match = false;
-                            break;
-                        }
+                lastActive.put(client, System.currentTimeMillis());
+                buffer.flip();
+                byte[] data = new byte[buffer.remaining()];
+                buffer.get(data);
+
+                StringBuilder sb = sessionStates.get(client);
+                if (sb != null) {
+                    if (sb.length() + data.length > limit) {
+                        closeConnection(client);
+                        return;
                     }
-                    if (match) {
-                        byte[] msg = new byte[i - start];
-                        System.arraycopy(combined, start, msg, 0, msg.length);
-                        processBusinessLogic(client, msg);
-                        start = i + activeDelim.length;
-                        i = start - 1;
+                    sb.append(new String(data));
+                    int index;
+                    while ((index = sb.indexOf(activeDelim)) != -1) {
+                        String message = sb.substring(0, index);
+                        processBusinessLogic(client, message);
+                        sb.delete(0, index + activeDelim.length());
                     }
                 }
-
-                byte[] leftover = new byte[combined.length - start];
-                System.arraycopy(combined, start, leftover, 0, leftover.length);
-
-                if (bytesRead == -1) {
-                    if (leftover.length > 0) {
-                        processBusinessLogic(client, leftover);
-                    }
-                    closeConnection(client);
-                } else {
-                    sessionBuffers.put(client, leftover);
-                    if (key.isValid()) {
-                        key.interestOps(SelectionKey.OP_READ);
-                        selector.wakeup();
-                    }
+                if (key.isValid()) {
+                    key.interestOps(SelectionKey.OP_READ);
+                    key.selector().wakeup();
                 }
             } catch (IOException e) {
                 closeConnection(client);
@@ -224,12 +198,9 @@ public class TcpServerEosSupport {
         });
     }
 
-    private void processBusinessLogic(SocketChannel client, byte[] message) {
+    private void processBusinessLogic(SocketChannel client, String message) {
         try {
-            if (message.length > 0) {
-                client.write(ByteBuffer.wrap(message));
-                client.write(ByteBuffer.wrap(new byte[]{0x0A}));
-            }
+            client.write(ByteBuffer.wrap(message.getBytes()));
         } catch (IOException e) {
             closeConnection(client);
         }
@@ -247,11 +218,10 @@ public class TcpServerEosSupport {
 
     private void closeConnection(SocketChannel client) {
         try {
-            sessionBuffers.remove(client);
+            sessionStates.remove(client);
             lastActive.remove(client);
-            Thread.sleep(50);
             client.close();
-        } catch (IOException | InterruptedException ignored) {
+        } catch (IOException ignored) {
         }
     }
 

@@ -159,7 +159,7 @@ public class TcpServerEosSupport {
         workerPool.submit(() -> {
             SocketChannel client = (SocketChannel) key.channel();
             ByteBuffer buffer = ByteBuffer.allocate(8192);
-            int limit = Integer.parseInt(getOpt("MAX_MESSAGE_SIZE", "10"));
+            int limit = Integer.parseInt(getOpt("MAX_MESSAGE_SIZE", "1000"));
 
             try {
                 int bytesRead = client.read(buffer);
@@ -177,12 +177,6 @@ public class TcpServerEosSupport {
                     System.arraycopy(incoming, 0, combined, existing.length, incoming.length);
                 } else {
                     combined = existing;
-                }
-
-                if (combined.length > limit) {
-                    System.out.println("[WARN ] Max message size exceeded. Closing connection.");
-                    closeConnection(client);
-                    return;
                 }
 
                 int start = 0;
@@ -205,6 +199,11 @@ public class TcpServerEosSupport {
 
                 byte[] leftover = new byte[combined.length - start];
                 System.arraycopy(combined, start, leftover, 0, leftover.length);
+
+                if (leftover.length > limit) {
+                    closeConnection(client);
+                    return;
+                }
 
                 if (bytesRead == -1) {
                     if (leftover.length > 0) {
