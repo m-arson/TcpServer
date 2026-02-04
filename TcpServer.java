@@ -221,7 +221,9 @@ public class TcpServer {
         long timeout = Long.parseLong(getOpt("IDLE_TIMEOUT_MS", "600000"));
 
         lastActive.forEach((client, time) -> {
-            if (now - time > timeout) closeConnection(client);
+            if (now - time > timeout) {
+                closeConnection(client);
+            }
         });
     }
 
