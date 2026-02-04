@@ -31,19 +31,17 @@ public class TcpServer {
                     line = line.trim();
                     if (line.isEmpty() || line.startsWith("#")) continue;
                     String[] parts = line.split("=", 2);
-                    if (parts.length == 2) {
-                        config.put(parts[0].trim(), parts[1].trim());
-                    }
+                    if (parts.length == 2) config.put(parts[0].trim(), parts[1].trim());
                 }
             }
         } catch (IOException e) {
-            System.err.println("Warning: Error reading .env file. Proceeding with defaults/mandatory check.");
+            System.err.println("Warning: Error reading .env file.");
         }
     }
 
     private void validateMandatory() {
         if (!config.containsKey("PORT") || config.getProperty("PORT").trim().isEmpty()) {
-            throw new RuntimeException("Fatal Error: PORT is required in .env but was not found.");
+            throw new RuntimeException("Fatal Error: PORT is required in .env");
         }
     }
 
@@ -59,7 +57,8 @@ public class TcpServer {
 
         this.workerPool = new ThreadPoolExecutor(
                 core, max, keepAlive, TimeUnit.SECONDS, 
-                new ArrayBlockingQueue<>(queueCap)
+                new ArrayBlockingQueue<>(queueCap),
+                new ThreadPoolExecutor.CallerRunsPolicy()
         );
     }
 
@@ -91,17 +90,15 @@ public class TcpServer {
         cleaner.scheduleAtFixedRate(this::cleanupIdleConnections, 
                 cleanupInterval, cleanupInterval, TimeUnit.MILLISECONDS);
 
-        System.out.println("Server started on " + host + ":" + port);
+        System.out.println("Hardened Server started on " + host + ":" + port);
 
         while (!Thread.currentThread().isInterrupted()) {
             if (selector.select() == 0) continue;
-            
             Iterator<SelectionKey> iter = selector.selectedKeys().iterator();
             while (iter.hasNext()) {
                 SelectionKey key = iter.next();
                 iter.remove();
                 if (!key.isValid()) continue;
-
                 if (key.isAcceptable()) {
                     handleAccept(serverChannel, selector);
                 } else if (key.isReadable()) {
@@ -124,6 +121,7 @@ public class TcpServer {
         workerPool.submit(() -> {
             SocketChannel client = (SocketChannel) key.channel();
             ByteBuffer buffer = ByteBuffer.allocate(2048);
+            int maxMsgSize = Integer.parseInt(getOpt("MAX_MESSAGE_SIZE", "10000"));
             try {
                 int bytesRead = client.read(buffer);
                 if (bytesRead == -1) {
@@ -137,6 +135,10 @@ public class TcpServer {
 
                 StringBuilder sb = sessionStates.get(client);
                 if (sb != null) {
+                    if (sb.length() + data.length > maxMsgSize) {
+                        closeConnection(client);
+                        return;
+                    }
                     sb.append(new String(data));
                     String content = sb.toString();
                     if (content.contains("\n")) {
