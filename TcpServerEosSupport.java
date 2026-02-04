@@ -7,7 +7,7 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
 
-public class TcpServer {
+public class TcpServerEosSupport {
 
     private final Properties config = new Properties();
     private final Map<SocketChannel, StringBuilder> sessionStates = new ConcurrentHashMap<>();
@@ -17,28 +17,39 @@ public class TcpServer {
     private ExecutorService workerPool;
     private Selector selector;
     private ServerSocketChannel serverChannel;
+    private final String delimiter;
 
-    public TcpServer() {
+    public TcpServerEosSupport() {
         loadConfig();
         validateMandatory();
         initializeThreadPool();
         setupShutdownHook();
+        this.delimiter = parseDelimiter(getOpt("DELIMITER", "0x0A"));
+    }
+
+    private String parseDelimiter(String input) {
+        try {
+            if (input.startsWith("0x")) {
+                int hex = Integer.parseInt(input.substring(2), 16);
+                return String.valueOf((char) hex);
+            }
+            System.err.println("[WARN ] Delimiter must be hex (0x..). Defaulting to 0x0A.");
+        } catch (Exception e) {
+            System.err.println("[WARN ] Invalid hex format: " + input + ". Defaulting to 0x0A.");
+        }
+        return "\n";
     }
 
     private void loadConfig() {
         try {
             if (Files.exists(Paths.get(".env"))) {
                 List<String> lines = Files.readAllLines(Paths.get(".env"));
-
                 for (String line : lines) {
                     line = line.trim();
-
                     if (line.isEmpty() || line.startsWith("#")) {
                         continue;
                     }
-
                     String[] parts = line.split("=", 2);
-
                     if (parts.length == 2) {
                         config.put(parts[0].trim(), parts[1].trim());
                     }
@@ -70,8 +81,7 @@ public class TcpServer {
             keepAlive,
             TimeUnit.SECONDS,
             new ArrayBlockingQueue<>(queueCap),
-            new ThreadPoolExecutor.CallerRunsPolicy()
-        );
+            new ThreadPoolExecutor.CallerRunsPolicy());
     }
 
     private void setupShutdownHook() {
@@ -79,19 +89,15 @@ public class TcpServer {
             try {
                 cleaner.shutdownNow();
                 workerPool.shutdown();
-
                 if (selector != null) {
                     selector.close();
                 }
-
                 if (serverChannel != null) {
                     serverChannel.close();
                 }
-
                 for (SocketChannel client : sessionStates.keySet()) {
                     client.close();
                 }
-
             } catch (IOException e) {
                 System.err.println("[ERROR] Shutdown: " + e.getMessage());
             }
@@ -99,15 +105,12 @@ public class TcpServer {
     }
 
     public void start() throws IOException {
-
         String host = getOpt("HOST", "0.0.0.0");
         int port = Integer.parseInt(config.getProperty("PORT"));
         long cleanupInterval = Long.parseLong(getOpt("CLEANUP_INTERVAL_MS", "30000"));
 
-
         this.selector = Selector.open();
         this.serverChannel = ServerSocketChannel.open();
-
         serverChannel.bind(new InetSocketAddress(host, port));
         serverChannel.configureBlocking(false);
         serverChannel.register(selector, SelectionKey.OP_ACCEPT);
@@ -117,23 +120,19 @@ public class TcpServer {
             cleanupInterval,
             TimeUnit.MILLISECONDS);
 
-        System.out.println("[INFO ] Hardened Server started on " + host + ":" + port);
+        System.out.println("[INFO ] Server started on " + host + ":" + port);
 
         while (!Thread.currentThread().isInterrupted()) {
             if (selector.select() == 0) {
                 continue;
             }
-
             Iterator<SelectionKey> iter = selector.selectedKeys().iterator();
-
             while (iter.hasNext()) {
                 SelectionKey key = iter.next();
                 iter.remove();
-
                 if (!key.isValid()) {
                     continue;
                 }
-
                 if (key.isAcceptable()) {
                     handleAccept(serverChannel, selector);
                 } else if (key.isReadable()) {
@@ -146,55 +145,47 @@ public class TcpServer {
 
     private void handleAccept(ServerSocketChannel serverChannel, Selector selector) throws IOException {
         SocketChannel client = serverChannel.accept();
-
         client.configureBlocking(false);
         client.register(selector, SelectionKey.OP_READ);
-
         sessionStates.put(client, new StringBuilder());
-
         lastActive.put(client, System.currentTimeMillis());
     }
 
     private void handleRead(SelectionKey key) {
+        final String activeDelim = this.delimiter;
         workerPool.submit(() -> {
             SocketChannel client = (SocketChannel) key.channel();
             ByteBuffer buffer = ByteBuffer.allocate(2048);
-
-            int maxMsgSize = Integer.parseInt(getOpt("MAX_MESSAGE_SIZE", "10000"));
+            int limit = Integer.parseInt(getOpt("MAX_MESSAGE_SIZE", "10000"));
 
             try {
                 int bytesRead = client.read(buffer);
                 if (bytesRead == -1) {
+                    StringBuilder sb = sessionStates.get(client);
+                    if (sb != null && sb.length() > 0) {
+                        processBusinessLogic(client, sb.toString());
+                    }
                     closeConnection(client);
                     return;
                 }
 
                 lastActive.put(client, System.currentTimeMillis());
-
                 buffer.flip();
-
                 byte[] data = new byte[buffer.remaining()];
-
                 buffer.get(data);
 
                 StringBuilder sb = sessionStates.get(client);
-
                 if (sb != null) {
-                    if (sb.length() + data.length > maxMsgSize) {
+                    if (sb.length() + data.length > limit) {
                         closeConnection(client);
                         return;
                     }
-
                     sb.append(new String(data));
-                    String content = sb.toString();
-
-                    if (content.contains("\n")) {
-                        String[] messages = content.split("\n", -1);
-                        for (int i = 0; i < messages.length - 1; i++) {
-                            processBusinessLogic(client, messages[i]);
-                        }
-                        sb.setLength(0);
-                        sb.append(messages[messages.length - 1]);
+                    int index;
+                    while ((index = sb.indexOf(activeDelim)) != -1) {
+                        String message = sb.substring(0, index);
+                        processBusinessLogic(client, message);
+                        sb.delete(0, index + activeDelim.length());
                     }
                 }
                 if (key.isValid()) {
@@ -209,8 +200,7 @@ public class TcpServer {
 
     private void processBusinessLogic(SocketChannel client, String message) {
         try {
-            String response = "OK: " + message.trim() + "\n";
-            client.write(ByteBuffer.wrap(response.getBytes()));
+            client.write(ByteBuffer.wrap(message.getBytes()));
         } catch (IOException e) {
             closeConnection(client);
         }
@@ -219,7 +209,6 @@ public class TcpServer {
     private void cleanupIdleConnections() {
         long now = System.currentTimeMillis();
         long timeout = Long.parseLong(getOpt("IDLE_TIMEOUT_MS", "600000"));
-
         lastActive.forEach((client, time) -> {
             if (now - time > timeout) {
                 closeConnection(client);
@@ -231,14 +220,12 @@ public class TcpServer {
         try {
             sessionStates.remove(client);
             lastActive.remove(client);
-
             client.close();
         } catch (IOException ignored) {
-
         }
     }
 
     public static void main(String[] args) throws IOException {
-        new TcpServer().start();
+        new TcpServerEosSupport().start();
     }
 }
