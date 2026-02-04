@@ -8,11 +8,13 @@ import java.util.*;
 import java.util.concurrent.*;
 
 public class TcpServer {
+
     private final Properties config = new Properties();
-    private ExecutorService workerPool;
     private final Map<SocketChannel, StringBuilder> sessionStates = new ConcurrentHashMap<>();
     private final Map<SocketChannel, Long> lastActive = new ConcurrentHashMap<>();
     private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
+
+    private ExecutorService workerPool;
     private Selector selector;
     private ServerSocketChannel serverChannel;
 
@@ -27,21 +29,29 @@ public class TcpServer {
         try {
             if (Files.exists(Paths.get(".env"))) {
                 List<String> lines = Files.readAllLines(Paths.get(".env"));
+
                 for (String line : lines) {
                     line = line.trim();
-                    if (line.isEmpty() || line.startsWith("#")) continue;
+
+                    if (line.isEmpty() || line.startsWith("#")) {
+                        continue;
+                    }
+
                     String[] parts = line.split("=", 2);
-                    if (parts.length == 2) config.put(parts[0].trim(), parts[1].trim());
+
+                    if (parts.length == 2) {
+                        config.put(parts[0].trim(), parts[1].trim());
+                    }
                 }
             }
         } catch (IOException e) {
-            System.err.println("Warning: Error reading .env file.");
+            System.err.println("[WARN ] Error reading .env file.");
         }
     }
 
     private void validateMandatory() {
         if (!config.containsKey("PORT") || config.getProperty("PORT").trim().isEmpty()) {
-            throw new RuntimeException("Fatal Error: PORT is required in .env");
+            throw new RuntimeException("[FATAL] PORT is required in .env");
         }
     }
 
@@ -50,15 +60,17 @@ public class TcpServer {
     }
 
     private void initializeThreadPool() {
-        int core = Integer.parseInt(getOpt("CORE_POOL_SIZE", "10"));
         int max = Integer.parseInt(getOpt("MAX_POOL_SIZE", "20"));
-        long keepAlive = Long.parseLong(getOpt("KEEP_ALIVE_TIME_SECONDS", "60"));
+        int core = Integer.parseInt(getOpt("CORE_POOL_SIZE", "10"));
         int queueCap = Integer.parseInt(getOpt("QUEUE_CAPACITY", "1000"));
+        long keepAlive = Long.parseLong(getOpt("KEEP_ALIVE_TIME_SECONDS", "60"));
 
-        this.workerPool = new ThreadPoolExecutor(
-                core, max, keepAlive, TimeUnit.SECONDS, 
-                new ArrayBlockingQueue<>(queueCap),
-                new ThreadPoolExecutor.CallerRunsPolicy()
+        this.workerPool = new ThreadPoolExecutor(core,
+            max,
+            keepAlive,
+            TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(queueCap),
+            new ThreadPoolExecutor.CallerRunsPolicy()
         );
     }
 
@@ -67,42 +79,65 @@ public class TcpServer {
             try {
                 cleaner.shutdownNow();
                 workerPool.shutdown();
-                if (selector != null) selector.close();
-                if (serverChannel != null) serverChannel.close();
-                for (SocketChannel client : sessionStates.keySet()) client.close();
+
+                if (selector != null) {
+                    selector.close();
+                }
+
+                if (serverChannel != null) {
+                    serverChannel.close();
+                }
+
+                for (SocketChannel client : sessionStates.keySet()) {
+                    client.close();
+                }
+
             } catch (IOException e) {
-                System.err.println("Shutdown error: " + e.getMessage());
+                System.err.println("[ERROR] Shutdown: " + e.getMessage());
             }
         }));
     }
 
     public void start() throws IOException {
-        int port = Integer.parseInt(config.getProperty("PORT"));
+
         String host = getOpt("HOST", "0.0.0.0");
+        int port = Integer.parseInt(config.getProperty("PORT"));
         long cleanupInterval = Long.parseLong(getOpt("CLEANUP_INTERVAL_MS", "30000"));
+
 
         this.selector = Selector.open();
         this.serverChannel = ServerSocketChannel.open();
+
         serverChannel.bind(new InetSocketAddress(host, port));
         serverChannel.configureBlocking(false);
         serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
-        cleaner.scheduleAtFixedRate(this::cleanupIdleConnections, 
-                cleanupInterval, cleanupInterval, TimeUnit.MILLISECONDS);
+        cleaner.scheduleAtFixedRate(this::cleanupIdleConnections,
+            cleanupInterval,
+            cleanupInterval,
+            TimeUnit.MILLISECONDS);
 
-        System.out.println("Hardened Server started on " + host + ":" + port);
+        System.out.println("[INFO ] Hardened Server started on " + host + ":" + port);
 
         while (!Thread.currentThread().isInterrupted()) {
-            if (selector.select() == 0) continue;
+            if (selector.select() == 0) {
+                continue;
+            }
+
             Iterator<SelectionKey> iter = selector.selectedKeys().iterator();
+
             while (iter.hasNext()) {
                 SelectionKey key = iter.next();
                 iter.remove();
-                if (!key.isValid()) continue;
+
+                if (!key.isValid()) {
+                    continue;
+                }
+
                 if (key.isAcceptable()) {
                     handleAccept(serverChannel, selector);
                 } else if (key.isReadable()) {
-                    key.interestOps(0); 
+                    key.interestOps(0);
                     handleRead(key);
                 }
             }
@@ -111,9 +146,12 @@ public class TcpServer {
 
     private void handleAccept(ServerSocketChannel serverChannel, Selector selector) throws IOException {
         SocketChannel client = serverChannel.accept();
+
         client.configureBlocking(false);
         client.register(selector, SelectionKey.OP_READ);
+
         sessionStates.put(client, new StringBuilder());
+
         lastActive.put(client, System.currentTimeMillis());
     }
 
@@ -121,26 +159,35 @@ public class TcpServer {
         workerPool.submit(() -> {
             SocketChannel client = (SocketChannel) key.channel();
             ByteBuffer buffer = ByteBuffer.allocate(2048);
+
             int maxMsgSize = Integer.parseInt(getOpt("MAX_MESSAGE_SIZE", "10000"));
+
             try {
                 int bytesRead = client.read(buffer);
                 if (bytesRead == -1) {
                     closeConnection(client);
                     return;
                 }
+
                 lastActive.put(client, System.currentTimeMillis());
+
                 buffer.flip();
+
                 byte[] data = new byte[buffer.remaining()];
+
                 buffer.get(data);
 
                 StringBuilder sb = sessionStates.get(client);
+
                 if (sb != null) {
                     if (sb.length() + data.length > maxMsgSize) {
                         closeConnection(client);
                         return;
                     }
+
                     sb.append(new String(data));
                     String content = sb.toString();
+
                     if (content.contains("\n")) {
                         String[] messages = content.split("\n", -1);
                         for (int i = 0; i < messages.length - 1; i++) {
@@ -162,7 +209,7 @@ public class TcpServer {
 
     private void processBusinessLogic(SocketChannel client, String message) {
         try {
-            String response = "OK: " + message.trim() + "\n";
+            String response = "Server Response: " + message.trim() + "\n";
             client.write(ByteBuffer.wrap(response.getBytes()));
         } catch (IOException e) {
             closeConnection(client);
@@ -172,6 +219,7 @@ public class TcpServer {
     private void cleanupIdleConnections() {
         long now = System.currentTimeMillis();
         long timeout = Long.parseLong(getOpt("IDLE_TIMEOUT_MS", "600000"));
+
         lastActive.forEach((client, time) -> {
             if (now - time > timeout) closeConnection(client);
         });
@@ -181,8 +229,11 @@ public class TcpServer {
         try {
             sessionStates.remove(client);
             lastActive.remove(client);
+
             client.close();
-        } catch (IOException ignored) {}
+        } catch (IOException ignored) {
+
+        }
     }
 
     public static void main(String[] args) throws IOException {
